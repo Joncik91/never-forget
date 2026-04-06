@@ -1,0 +1,26 @@
+{
+  "name": "never-forget",
+  "version": "1.0.0",
+  "description": "Redundancy & Logical Contingency Framework — a dependency validation engine with Trigger-Action-Validation loops",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src",
+    "format": "echo 'no formatter configured'"
+  },
+  "keywords": ["contingency", "dependency", "validation", "framework"],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.5.2",
+    "eslint": "^10.2.0",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.58.0",
+    "vitest": "^4.1.2"
+  }
+}
