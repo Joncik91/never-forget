@@ -6,12 +6,6 @@ A TypeScript library for tracking critical dependencies and enforcing "if this, 
 
 You know that when building **C**, dependencies **A** and **B** are essential. But in the momentum of building, they get forgotten. This library makes that impossible.
 
-## Install
-
-```bash
-npm install never-forget
-```
-
 ## Quick Start
 
 ```typescript
