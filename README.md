@@ -1,6 +1,24 @@
 # Never Forget
 
-A TypeScript library for tracking critical dependencies and enforcing "if this, then that" logic during complex project builds.
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![License: ISC](https://img.shields.io/badge/license-ISC-E8954A.svg)](LICENSE)
+[![Tested with Vitest](https://img.shields.io/badge/tested%20with-vitest-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
+[![Zero deps](https://img.shields.io/badge/zero%20deps-✓-E8954A)]()
+[![ESM](https://img.shields.io/badge/format-ESM-E8954A)]()
+
+**A TypeScript library for tracking critical dependencies and enforcing "if this, then that" logic during complex project builds.**
+
+When you're building **C**, dependencies **A** and **B** are essential. But in the momentum of building, they get forgotten. This library makes that impossible — the engine enforces dependency state, blocks transitions through logic gates, auto-generates shadow tasks for every dependency, and audits the whole thing through an observer protocol.
+
+## Table of Contents
+
+- [The Problem](#the-problem)
+- [Quick Start](#quick-start)
+- [Core Concepts](#core-concepts)
+- [API](#api)
+- [Develop](#develop)
+- [Security](#security)
+- [License](#license)
 
 ## The Problem
 
@@ -126,6 +144,24 @@ npm run lint      # eslint
 npm run build     # compile to dist/
 ```
 
+## Security
+
+The library is **pure-logic in-process**. No I/O, no network, no
+filesystem access — `ContingencyEngine` operates entirely on objects
+in memory. Two practical implications:
+
+- **Audit surface is small.** `find src/ -name '*.ts' | xargs wc -l`
+  reads end-to-end in one sitting. Read it before adopting in
+  load-bearing pipelines.
+- **`proofOfWork` URLs are caller-supplied strings.** The engine
+  stores them verbatim and surfaces them in observer events; it
+  never fetches them. If you log observer output, treat
+  `proofOfWork` strings the same way you treat user input — they
+  could carry whatever the caller put there.
+
+The library has zero runtime dependencies and ships ESM-only.
+Everything you bring into your project is what you read in `src/`.
+
 ## License
 
-ISC
+ISC — see [LICENSE](LICENSE).
