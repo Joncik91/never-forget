@@ -1,7 +1,7 @@
 # Never Forget
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![License: ISC](https://img.shields.io/badge/license-ISC-E8954A.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-E8954A.svg)](LICENSE)
 [![Tested with Vitest](https://img.shields.io/badge/tested%20with-vitest-6E9F18?logo=vitest&logoColor=white)](https://vitest.dev/)
 [![Zero deps](https://img.shields.io/badge/zero%20deps-✓-E8954A)]()
 [![ESM](https://img.shields.io/badge/format-ESM-E8954A)]()
@@ -164,4 +164,4 @@ Everything you bring into your project is what you read in `src/`.
 
 ## License
 
-ISC — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
