@@ -25,6 +25,7 @@ import {
   ProjectLockedError,
   ValidationError,
 } from "./errors.js";
+import { getTaskBlockers } from "./logic-gate.js";
 import {
   assertValidConfigShape,
   assertValidDependency,
@@ -91,13 +92,19 @@ function dependencyIdSet(project: Project): Set<string> {
   return new Set(project.dependencies.map((d) => d.id));
 }
 
-function clone<T>(value: T): T {
-  return structuredClone(value);
+/** Deep copy of caller input. Non-cloneable input (functions, proxies) becomes a ValidationError. */
+function clone<T>(value: T, what: string): T {
+  try {
+    return structuredClone(value);
+  } catch (err) {
+    throw new ValidationError(what, [`must be plain data (${err instanceof Error ? err.message : String(err)})`]);
+  }
 }
 
 // --- Construction ---
 
-export function createProject(config: ProjectConfig): Project {
+export function createProject(input: ProjectConfig): Project {
+  const config = clone(input, "project config");
   assertValidConfigShape(config);
   const timestamp = now();
   let project: Project = {
@@ -124,9 +131,11 @@ export function createProject(config: ProjectConfig): Project {
 
 export function addDependency(project: Project, dependency: Dependency): Project {
   assertMutable(project);
-  assertValidDependency(dependency);
-  assertEntityIdFree(project, "Dependency", dependency.id);
-  return touch({ ...project, dependencies: [...project.dependencies, clone(dependency)] });
+  // Clone before validating so getters cannot pass validation and then change.
+  const dep = clone(dependency, "dependency");
+  assertValidDependency(dep);
+  assertEntityIdFree(project, "Dependency", dep.id);
+  return touch({ ...project, dependencies: [...project.dependencies, dep] });
 }
 
 export function updateDependencyState(
@@ -138,6 +147,10 @@ export function updateDependencyState(
   assertMutable(project);
   const index = project.dependencies.findIndex((d) => d.id === dependencyId);
   if (index === -1) throw new NotFoundError("Dependency", dependencyId);
+  const current = project.dependencies[index];
+  if (current.state === newState && (proofOfWork === undefined || proofOfWork === current.proofOfWork)) {
+    return project;
+  }
   const next: Dependency = {
     ...project.dependencies[index],
     state: newState,
@@ -154,9 +167,12 @@ export function updateDependencyState(
 
 export function addTask(project: Project, task: Task): Project {
   assertMutable(project);
-  assertValidTask(task, dependencyIdSet(project));
-  assertEntityIdFree(project, "Task", task.id);
-  return touch({ ...project, tasks: [...project.tasks, clone(task)] });
+  const copy = clone(task, "task");
+  assertValidTask(copy, dependencyIdSet(project));
+  assertEntityIdFree(project, "Task", copy.id);
+  const next = touch({ ...project, tasks: [...project.tasks, copy] });
+  if (copy.state === "complete") assertTaskNotBlocked(next, copy.id);
+  return next;
 }
 
 function assertTaskState(state: unknown, what: string): asserts state is TaskState {
@@ -165,17 +181,33 @@ function assertTaskState(state: unknown, what: string): asserts state is TaskSta
   }
 }
 
+function assertTaskNotBlocked(project: Project, taskId: string): void {
+  const blockers = getTaskBlockers(project, taskId);
+  if (blockers.length > 0) throw new GateBlockedError(blockers, `task:${taskId}`);
+}
+
+/** Completing a task is refused while a triggered `block` gate targets it. */
 export function updateTaskState(project: Project, taskId: string, newState: TaskState): Project {
   assertMutable(project);
   assertTaskState(newState, "task update");
   const index = project.tasks.findIndex((t) => t.id === taskId);
   if (index === -1) throw new NotFoundError("Task", taskId);
+  if (project.tasks[index].state === newState) return project;
+  if (newState === "complete") assertTaskNotBlocked(project, taskId);
   const tasks = project.tasks.slice();
   tasks[index] = { ...tasks[index], state: newState };
   return touch({ ...project, tasks });
 }
 
 function selectReactions(task: Task, selector: ReactionSelector): Reaction[] {
+  const sel: unknown = selector;
+  const valid =
+    typeof sel === "object" && sel !== null &&
+    (typeof (sel as { reactionId?: unknown }).reactionId === "string" ||
+      typeof (sel as { dependencyId?: unknown }).dependencyId === "string");
+  if (!valid) {
+    throw new ValidationError("reaction selector", ["must be { reactionId: string } or { dependencyId: string }"]);
+  }
   if ("reactionId" in selector) {
     const r = task.reactions.find((x) => x.id === selector.reactionId);
     if (!r) throw new NotFoundError(`Reaction on task ${task.id}`, selector.reactionId);
@@ -219,11 +251,12 @@ export function updateReactionState(
 
 export function addLogicGate(project: Project, gate: LogicGate): Project {
   assertMutable(project);
-  assertValidLogicGate(gate);
-  if (project.logicGates.some((g) => g.id === gate.id)) {
-    throw new DuplicateIdError("Logic gate", gate.id);
+  const copy = clone(gate, "logic gate");
+  assertValidLogicGate(copy);
+  if (project.logicGates.some((g) => g.id === copy.id)) {
+    throw new DuplicateIdError("Logic gate", copy.id);
   }
-  return touch({ ...project, logicGates: [...project.logicGates, clone(gate)] });
+  return touch({ ...project, logicGates: [...project.logicGates, copy] });
 }
 
 export function setLogicGateEnabled(project: Project, gateId: string, enabled: boolean): Project {
@@ -233,6 +266,7 @@ export function setLogicGateEnabled(project: Project, gateId: string, enabled: b
   }
   const index = project.logicGates.findIndex((g) => g.id === gateId);
   if (index === -1) throw new NotFoundError("Logic gate", gateId);
+  if (project.logicGates[index].enabled === enabled) return project;
   const logicGates = project.logicGates.slice();
   logicGates[index] = { ...logicGates[index], enabled };
   return touch({ ...project, logicGates });
@@ -240,6 +274,11 @@ export function setLogicGateEnabled(project: Project, gateId: string, enabled: b
 
 // --- State machine ---
 
+/**
+ * Low-level, UNGUARDED state change: checks only that the edge exists in the
+ * state machine. Use `advanceState()` (or the engine) to enforce the entry
+ * gate, exit criteria and logic gates.
+ */
 export function transitionState(project: Project, newState: ProjectState): Project {
   assertCanTransition(project, newState);
   return touch({ ...project, state: newState });

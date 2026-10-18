@@ -186,8 +186,15 @@ defined → gated → building ⇄ review ⇄ complete → deployed
 
 `passEntryGate`, `startBuilding`, `submitForReview`, `requestChanges`
 (review → building), `markComplete`, `reopen` (complete → review), `deploy`.
-The three forward exits (`submitForReview`, `markComplete`, `deploy`) all
-re-run `checkExitCriteria()`, because state can change during review.
+Each method only works from its own source state (`submitForReview()` on a
+complete project throws; it never acts as `reopen()`). The three forward
+exits (`submitForReview`, `markComplete`, `deploy`) re-check exit criteria
+on both the current and the resulting state, because state can change
+during review and gates can key on the target state.
+
+Functional users get the same rules from `advanceState(project, to)`.
+`transitionState()` is the unguarded primitive; it only checks the edge
+exists.
 
 ### Observer Protocol
 
@@ -206,14 +213,17 @@ observer.droppedCount(); // events evicted so far
 ```
 
 A throwing listener never breaks the engine; errors go to
-`onListenerError` (default `console.error`).
+`onListenerError` (default `console.error`). Listeners must not mutate the
+engine synchronously; such calls throw (defer them with `queueMicrotask`).
 
 ### Errors
 
 All errors extend `NeverForgetError`: `GateBlockedError` (with `gate` and
 `blockers`), `InvalidStateTransitionError`, `ValidationError` (with every
 `issue`), `DuplicateIdError`, `NotFoundError`, `ProjectLockedError`. A call
-that throws leaves the engine state unchanged.
+that throws leaves the project state unchanged; a blocked call does record
+its blockers as `gate_blocked` audit events. Calls that change nothing log
+nothing.
 
 ## API
 
@@ -222,6 +232,7 @@ that throws leaves the engine state unchanged.
 | `ContingencyEngine` | Main orchestrator — start here |
 | `createProject()` | Create a validated, immutable project object |
 | `addDependency()`, `addTask()`, `addLogicGate()`, `update*State()` | Pure, immutable project edits |
+| `advanceState()`, `getExitBlockers()` | Guarded lifecycle for the pure API |
 | `evaluateEntryGate()` | Check if gate passes |
 | `runPreFlightChecks()` | Station check at 0% (advisory checks have `blocking: false`) |
 | `runPostFlightChecks()` | Station check at 100% |

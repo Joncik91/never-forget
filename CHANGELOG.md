@@ -43,6 +43,9 @@ README Quick Start runs as a test (`readme.test.ts`).
 - **Wrong error types.** The engine threw plain `Error` where the pure API
   threw `GateBlockedError`. Every library error now extends
   `NeverForgetError`.
+- **The pure API skipped every gate.** Added `advanceState()` (entry gate,
+  exit criteria, logic gates); pure `updateTaskState`/`addTask` honour
+  task-blocking gates. `transitionState()` is documented as unguarded.
 - **Advisory pre-flight check failed the run.** "No logic gates — consider
   adding" made `allPassed` false. Checks now carry `blocking`.
 - **Timestamps.** `createdAt` and `updatedAt` came from two clock reads.
@@ -70,7 +73,16 @@ README Quick Start runs as a test (`readme.test.ts`).
   state (generated tasks, gate edges, complexity, proof) reconciles after each
   commit. Events are edge-triggered, so warnings fire once per crossing
   instead of on every call. `subscribe()` replaces polling `getEvents()`.
-- Engine delegates to the pure core instead of duplicating it.
+- Engine delegates to the pure core instead of duplicating it; engine and
+  pure API share one guarded lifecycle (`lifecycle.ts`).
+- Exit criteria hold before and after each exit move, including tasks that
+  gates generate because of the move; a task-blocking gate that triggers
+  after its task completed blocks exit.
+- Named transitions are bound to their source state.
+- Inputs are cloned before validation (getters cannot swap values after the
+  check); non-cloneable input is a `ValidationError`.
+- No-op updates are neither committed nor logged; listeners cannot re-enter
+  the engine mid-update.
 - Runtime validation (`validate.ts`) for every public input, reporting all
   issues at once (`ValidationError.issues`).
 - Deployed projects are immutable (`ProjectLockedError`).

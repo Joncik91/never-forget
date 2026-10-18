@@ -88,6 +88,9 @@ export {
   findMissingReactions,
 } from "./project.js";
 
+// Guarded lifecycle (pure)
+export { advanceState, getExitBlockers, isExitTransition } from "./lifecycle.js";
+
 // Logic gates
 export {
   evaluateCondition,

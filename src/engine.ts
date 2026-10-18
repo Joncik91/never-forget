@@ -20,7 +20,6 @@ import {
   addDependency,
   addLogicGate,
   addTask,
-  assertCanTransition,
   createProject,
   evaluateEntryGate,
   findMissingReactions,
@@ -28,15 +27,15 @@ import {
   runPostFlightChecks,
   runPreFlightChecks,
   setLogicGateEnabled,
-  transitionState,
   updateDependencyState,
   updateReactionState,
   updateTaskState,
 } from "./project.js";
-import { applyGeneratedTasks, evaluateAllGates, getTaskBlockers } from "./logic-gate.js";
+import { advanceState, getExitBlockers, isExitTransition } from "./lifecycle.js";
+import { applyGeneratedTasks, evaluateAllGates } from "./logic-gate.js";
 import { generateShadowTasks } from "./shadow-task.js";
 import { calculateComplexity } from "./complexity.js";
-import { GateBlockedError } from "./errors.js";
+import { GateBlockedError, InvalidStateTransitionError, NeverForgetError } from "./errors.js";
 import {
   createObserver,
   observeActionWithoutReaction,
@@ -52,11 +51,10 @@ import {
 // ============================================================================
 // ContingencyEngine — the stateful orchestrator around the pure core.
 //
-// Every mutation is atomic: the next state is computed by a pure function
-// (which throws on invalid input), then committed in one step. After each
-// commit the engine reconciles derived state reactively — generated tasks,
-// logic-gate edges, complexity and proof warnings — so consumers subscribe to
-// events instead of polling.
+// Every mutation runs a pure function that returns the next state or throws;
+// only then is it committed. After each commit the engine reconciles derived
+// state reactively — generated tasks, logic-gate edges, complexity and proof
+// warnings — so consumers subscribe to events instead of polling.
 // ============================================================================
 
 export interface EngineOptions {
@@ -82,6 +80,10 @@ function gateSeverity(r: GateEvaluation): Severity {
   return r.action.type === "warn" ? "warning" : "info";
 }
 
+function countReactions(p: Project): number {
+  return p.tasks.reduce((n, t) => n + t.reactions.length, 0);
+}
+
 export class ContingencyEngine {
   #project: Project;
   readonly #observer: Observer;
@@ -90,6 +92,7 @@ export class ContingencyEngine {
   readonly #proofFlagged = new Set<string>();
   readonly #reportedSkips = new Set<string>();
   #complexityExceeded = false;
+  #busy = false;
 
   constructor(config: ProjectConfig, options: EngineOptions = {}) {
     this.#observer = options.observer ?? createObserver();
@@ -116,7 +119,7 @@ export class ContingencyEngine {
     return this.#observer.getEventsBySeverity("warning");
   }
 
-  /** Live event stream. Returns an unsubscribe function. */
+  /** Live event stream. Returns an unsubscribe function. Listeners must not mutate the engine synchronously. */
   subscribe(listener: ObserverListener): () => void {
     return this.#observer.subscribe(listener);
   }
@@ -124,47 +127,52 @@ export class ContingencyEngine {
   // --- Dependencies ---
 
   addDependency(dependency: Dependency): this {
-    const next = addDependency(this.#project, dependency);
-    this.#apply(next, () =>
-      this.#log("dependency_added", dependency.id, `Dependency "${dependency.name}" added with priority ${dependency.priority}`),
+    return this.#mutate(
+      (p) => addDependency(p, dependency),
+      (next) => {
+        const d = next.dependencies[next.dependencies.length - 1];
+        this.#log("dependency_added", d.id, `Dependency "${d.name}" added with priority ${d.priority}`);
+      },
     );
-    return this;
   }
 
   updateDependencyState(dependencyId: string, newState: DependencyState, proofOfWork?: string): this {
     const before = this.#project.dependencies.find((d) => d.id === dependencyId)?.state;
-    const next = updateDependencyState(this.#project, dependencyId, newState, proofOfWork);
-    this.#apply(next, () =>
-      this.#log(
-        "dependency_updated",
-        dependencyId,
-        `Dependency state ${before} → ${newState}${proofOfWork !== undefined ? " (proof attached)" : ""}`,
-      ),
+    return this.#mutate(
+      (p) => updateDependencyState(p, dependencyId, newState, proofOfWork),
+      () =>
+        this.#log(
+          "dependency_updated",
+          dependencyId,
+          `Dependency state ${before} → ${newState}${proofOfWork !== undefined ? " (proof attached)" : ""}`,
+        ),
     );
-    return this;
   }
 
   // --- Tasks ---
 
+  /** A task added as complete faces the same task-blocking gates as completing it later. */
   addTask(task: Task): this {
-    const next = addTask(this.#project, task);
-    if (task.state === "complete") this.#assertTaskNotBlocked(next, task.id);
-    this.#apply(next, () => {
-      this.#log("task_added", task.id, `Task "${task.name}" added (${task.state})`);
-      if (task.state === "complete") this.#flagUnaddressed(task.id);
-    });
-    return this;
+    return this.#mutate(
+      (p) => addTask(p, task),
+      (next) => {
+        const t = next.tasks[next.tasks.length - 1];
+        this.#log("task_added", t.id, `Task "${t.name}" added (${t.state})`);
+        if (t.state === "complete") this.#flagUnaddressed(t.id);
+      },
+    );
   }
 
+  /** Completing a task is refused while a triggered `block` gate targets it. */
   updateTaskState(taskId: string, newState: TaskState): this {
     const before = this.#project.tasks.find((t) => t.id === taskId)?.state;
-    if (newState === "complete" && before !== "complete") this.#assertTaskNotBlocked(this.#project, taskId);
-    const next = updateTaskState(this.#project, taskId, newState);
-    this.#apply(next, () => {
-      this.#log("task_updated", taskId, `Task state ${before} → ${newState}`);
-      if (newState === "complete" && before !== "complete") this.#flagUnaddressed(taskId);
-    });
-    return this;
+    return this.#mutate(
+      (p) => updateTaskState(p, taskId, newState),
+      () => {
+        this.#log("task_updated", taskId, `Task state ${before} → ${newState}`);
+        if (newState === "complete") this.#flagUnaddressed(taskId);
+      },
+    );
   }
 
   /** Update one reaction (`{ reactionId }`) or all of a task's reactions for a dependency (`{ dependencyId }`). */
@@ -174,38 +182,44 @@ export class ContingencyEngine {
     newState: TaskState,
     proofOfWork?: string,
   ): this {
-    const next = updateReactionState(this.#project, taskId, selector, newState, proofOfWork);
-    const which = "reactionId" in selector ? `reaction ${selector.reactionId}` : `reactions for ${selector.dependencyId}`;
-    this.#apply(next, () => this.#log("reaction_updated", taskId, `Task "${taskId}" ${which} → ${newState}`));
-    return this;
+    return this.#mutate(
+      (p) => updateReactionState(p, taskId, selector, newState, proofOfWork),
+      () => {
+        const which =
+          "reactionId" in selector ? `reaction ${selector.reactionId}` : `reactions for ${selector.dependencyId}`;
+        this.#log("reaction_updated", taskId, `Task "${taskId}" ${which} → ${newState}`);
+      },
+    );
   }
 
   // --- Logic Gates ---
 
   addLogicGate(gate: LogicGate): this {
-    const next = addLogicGate(this.#project, gate);
-    this.#apply(next, () => this.#log("logic_gate_added", gate.id, `Logic gate "${gate.name}" added`));
-    return this;
+    return this.#mutate(
+      (p) => addLogicGate(p, gate),
+      (next) => {
+        const g = next.logicGates[next.logicGates.length - 1];
+        this.#log("logic_gate_added", g.id, `Logic gate "${g.name}" added`);
+      },
+    );
   }
 
   setLogicGateEnabled(gateId: string, enabled: boolean): this {
-    const next = setLogicGateEnabled(this.#project, gateId, enabled);
-    this.#apply(next, () =>
-      this.#log("logic_gate_updated", gateId, `Logic gate ${enabled ? "enabled" : "disabled"}`),
+    return this.#mutate(
+      (p) => setLogicGateEnabled(p, gateId, enabled),
+      () => this.#log("logic_gate_updated", gateId, `Logic gate ${enabled ? "enabled" : "disabled"}`),
     );
-    return this;
   }
 
   // --- Shadow Tasks ---
 
   generateShadowTasks(): this {
-    const countReactions = (p: Project) => p.tasks.reduce((n, t) => n + t.reactions.length, 0);
-    const next = generateShadowTasks(this.#project);
-    const added = countReactions(next) - countReactions(this.#project);
-    this.#apply(next, () =>
-      this.#log("shadow_task_generated", "project", `${added} shadow reaction(s) generated`),
+    const before = countReactions(this.#project);
+    return this.#mutate(
+      (p) => generateShadowTasks(p),
+      (next) =>
+        this.#log("shadow_task_generated", "project", `${countReactions(next) - before} shadow reaction(s) generated`),
     );
-    return this;
   }
 
   // --- Gate Evaluation ---
@@ -215,18 +229,7 @@ export class ContingencyEngine {
   }
 
   passEntryGate(): this {
-    assertCanTransition(this.#project, "gated");
-    const result = evaluateEntryGate(this.#project);
-    if (result.blocked) {
-      for (const blocker of result.blockers) observeGateBlocked(this.#observer, "entry", blocker);
-      throw new GateBlockedError(result.blockers, "entry");
-    }
-    const from = this.#project.state;
-    this.#apply(transitionState(this.#project, "gated"), () => {
-      observeGatePassed(this.#observer, "entry");
-      observeStateTransition(this.#observer, from, "gated");
-    });
-    return this;
+    return this.#transition("defined", "gated");
   }
 
   evaluateLogicGates(): ValidationResult {
@@ -243,47 +246,45 @@ export class ContingencyEngine {
     return runPostFlightChecks(this.#project);
   }
 
-  /** Everything that would stop the project leaving the build right now: post-flight failures and blocking logic gates. */
+  /**
+   * What would stop the project leaving the build in its current state. Exit
+   * transitions re-run this on the resulting state, so gates keyed on the
+   * target state (e.g. `project.state eq "review"`) are enforced too.
+   */
   checkExitCriteria(): ExitCriteria {
-    const blockers: string[] = [];
-    for (const check of runPostFlightChecks(this.#project).checks) {
-      if (!check.passed && check.blocking !== false) {
-        blockers.push(check.details ? `${check.message}: ${check.details}` : check.message);
-      }
-    }
-    blockers.push(...evaluateAllGates(this.#project).errors);
+    const blockers = getExitBlockers(this.#project);
     return { passed: blockers.length === 0, blockers };
   }
 
   // --- State Transitions ---
 
   startBuilding(): this {
-    return this.#transition("building", false);
+    return this.#transition("gated", "building");
   }
 
   /** building → review. Requires exit criteria. */
   submitForReview(): this {
-    return this.#transition("review", true);
+    return this.#transition("building", "review");
   }
 
   /** review → building, for rework after review. */
   requestChanges(): this {
-    return this.#transition("building", false);
+    return this.#transition("review", "building");
   }
 
   /** review → complete. Re-checks exit criteria; state may have changed during review. */
   markComplete(): this {
-    return this.#transition("complete", true);
+    return this.#transition("review", "complete");
   }
 
   /** complete → review. */
   reopen(): this {
-    return this.#transition("review", false);
+    return this.#transition("complete", "review");
   }
 
   /** complete → deployed (terminal, immutable). Re-checks exit criteria. */
   deploy(): this {
-    return this.#transition("deployed", true);
+    return this.#transition("complete", "deployed");
   }
 
   // --- Complexity ---
@@ -307,28 +308,46 @@ export class ContingencyEngine {
     this.#observer.log({ type, subject, details, severity });
   }
 
-  #transition(to: ProjectState, requireExitCriteria: boolean): this {
-    assertCanTransition(this.#project, to);
-    if (requireExitCriteria) {
-      const exit = this.checkExitCriteria();
-      if (!exit.passed) {
-        for (const blocker of exit.blockers) observeGateBlocked(this.#observer, "exit", blocker);
-        throw new GateBlockedError(exit.blockers, "exit");
-      }
+  /** Each named transition is bound to one source state, so e.g. submitForReview() can never act as reopen(). */
+  #transition(from: ProjectState, to: ProjectState): this {
+    if (this.#project.state !== from) {
+      throw new InvalidStateTransitionError(this.#project.state, to, `this operation requires state ${from}`);
     }
-    const from = this.#project.state;
-    this.#apply(transitionState(this.#project, to), () => {
-      if (requireExitCriteria) observeGatePassed(this.#observer, "exit");
-      observeStateTransition(this.#observer, from, to);
-    });
-    return this;
+    const gate = to === "gated" ? "entry" : isExitTransition(from, to) ? "exit" : undefined;
+    return this.#mutate(
+      (p) => advanceState(p, to),
+      () => {
+        if (gate) observeGatePassed(this.#observer, gate);
+        observeStateTransition(this.#observer, from, to);
+      },
+    );
   }
 
-  #assertTaskNotBlocked(project: Project, taskId: string): void {
-    const blockers = getTaskBlockers(project, taskId);
-    if (blockers.length === 0) return;
-    for (const b of blockers) observeGateBlocked(this.#observer, `task:${taskId}`, b);
-    throw new GateBlockedError(blockers, `task:${taskId}`);
+  /**
+   * Runs a pure update and commits it. A refused update logs its blockers as
+   * `gate_blocked` audit events, then rethrows; project state is untouched.
+   * An update that changes nothing is neither committed nor logged.
+   */
+  #mutate(update: (p: Project) => Project, logAction: (next: Project) => void): this {
+    if (this.#busy) {
+      throw new NeverForgetError("Re-entrant engine update: listeners must not mutate the engine synchronously");
+    }
+    this.#busy = true;
+    try {
+      let next: Project;
+      try {
+        next = update(this.#project);
+      } catch (err) {
+        if (err instanceof GateBlockedError) {
+          for (const b of err.blockers) observeGateBlocked(this.#observer, err.gate, b);
+        }
+        throw err;
+      }
+      if (next !== this.#project) this.#apply(next, logAction);
+      return this;
+    } finally {
+      this.#busy = false;
+    }
   }
 
   /** Real-time "action without reaction" detection when a task completes. */
@@ -339,10 +358,10 @@ export class ContingencyEngine {
   }
 
   /** Commits a new state, logs the triggering action, then reconciles derived state. */
-  #apply(next: Project, logAction?: () => void): void {
+  #apply(next: Project, logAction?: (next: Project) => void): void {
     const { project, generated, skipped } = applyGeneratedTasks(next);
     this.#project = deepFreeze(project);
-    logAction?.();
+    logAction?.(this.#project);
 
     for (const g of generated) {
       this.#log("task_generated", g.task.id, `Task "${g.task.name}" generated by logic gate ${g.gateId}`);
