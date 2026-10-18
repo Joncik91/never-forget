@@ -35,6 +35,11 @@ const engine = new ContingencyEngine({
   requireProofOfWork: true,
 });
 
+// React to everything the engine notices, as it happens
+const unsubscribe = engine.subscribe((event) => {
+  if (event.severity !== "info") console.warn(`[${event.type}] ${event.details}`);
+});
+
 // Define what must not be forgotten (A and B)
 engine.addDependency({
   id: "docs",
@@ -56,7 +61,7 @@ engine.addDependency({
 engine.passEntryGate();
 engine.startBuilding();
 
-// Add tasks — shadow tasks auto-generate for each dependency
+// Add tasks — shadow tasks give every task one reaction per dependency
 engine.addTask({ id: "migrate", name: "Run Migration", state: "pending", reactions: [] });
 engine.addTask({ id: "deploy", name: "Deploy", state: "pending", reactions: [] });
 engine.generateShadowTasks();
@@ -70,14 +75,25 @@ engine.addLogicGate({
   enabled: true,
 });
 
-// Complete work
-engine.updateTaskState("migrate", "complete");
-engine.updateTaskState("deploy", "complete");
+// Do the work: address each dependency for each task, then finish the task
+for (const task of ["migrate", "deploy"]) {
+  engine.updateReactionState(task, { dependencyId: "docs" }, "complete");
+  engine.updateReactionState(task, { dependencyId: "tests" }, "complete");
+  engine.updateTaskState(task, "complete");
+}
 
-// Post-flight checks enforce everything was done
+// Exit transitions re-check post-flight checks and logic gates every time
 engine.submitForReview();
 engine.markComplete();
-engine.deploy();
+engine.deploy(); // deployed projects are immutable
+
+unsubscribe();
+```
+
+Anything missing throws a typed error that says exactly what is missing:
+
+```text
+GateBlockedError: Exit gate blocked: 1 incomplete reactions for required dependencies: Deploy → Integration Tests
 ```
 
 ## Core Concepts
@@ -95,13 +111,35 @@ engine.addDependency({
 });
 ```
 
+Dependencies and tasks share one id namespace (so logic gates can refer to
+either unambiguously). `"project"` and the project id are reserved.
+
 ### Entry Gate
 
-Blocks the project from starting until all **required** dependencies are ready. If `requireProofOfWork` is on, each dep needs evidence.
+Blocks the project from starting until at least one dependency is
+**required** and every required dependency is past `identified`. If
+`requireProofOfWork` is on, each required dependency also needs evidence.
+
+### Shadow Tasks and the coverage invariant
+
+Every task must have a **completed reaction for every required
+dependency** before the project can leave the build. This holds for tasks
+added at any time, not just those present when shadows were generated.
+
+`generateShadowTasks()` creates the missing reactions (idempotent).
+Complete them by dependency or by reaction id:
+
+```typescript
+engine.updateReactionState("deploy", { dependencyId: "docs" }, "complete", "https://link/to/proof");
+engine.updateReactionState("deploy", { reactionId: "shadow-deploy:docs" }, "complete");
+```
+
+Open reactions for `recommended`/`optional` dependencies are reported as an
+advisory post-flight check; they do not block.
 
 ### Logic Gates
 
-If/then rules that block or warn during the build:
+If/then rules evaluated reactively after every change:
 
 ```typescript
 engine.addLogicGate({
@@ -113,36 +151,104 @@ engine.addLogicGate({
 });
 ```
 
-Operators: `eq`, `neq`, `in`, `not_in`, `exists`
+**Subjects:** `"project"` (or the project id), a dependency id, or a task id.
 
-### Shadow Tasks
+| Subject | Properties |
+|---|---|
+| project | `state`, `name`, `dependencyCount`, `taskCount`, `logicGateCount`, `complexity`, `complexityThreshold`, `requireProofOfWork` |
+| dependency | `state`, `name`, `priority`, `hasProof`, `proofOfWork` |
+| task | `state`, `name`, `reactionCount`, `incompleteReactionCount` |
 
-Auto-generates sub-tasks for every dependency on every task. No dependency gets silently skipped.
+**Operators:** `eq`, `neq` (string), `in`, `not_in` (string array),
+`exists`, `gt`, `gte`, `lt`, `lte` (number, numeric properties only).
+
+**Actions:**
+
+| Action | Effect while the condition holds |
+|---|---|
+| `block` → `target: "project"` | Blocks `submitForReview`, `markComplete`, `deploy` |
+| `block` → `target: "<task id>"` | Blocks completing that task |
+| `require_state` → `target`, `state` | Blocks exit unless the target dependency/task is in `state` |
+| `warn` | Logs a warning when it starts triggering |
+| `notify` | Logs an info event when it starts triggering |
+| `generate_task` → `task: { id, name }` | Creates the task once (pending) |
+
+A gate that refers to an unknown subject or property, or compares a
+non-numeric property with `gt`, **fails closed**: it blocks exit with a
+"misconfigured" message instead of silently never firing. Toggle gates with
+`setLogicGateEnabled(id, enabled)`.
+
+### Lifecycle
+
+```text
+defined → gated → building ⇄ review ⇄ complete → deployed
+```
+
+`passEntryGate`, `startBuilding`, `submitForReview`, `requestChanges`
+(review → building), `markComplete`, `reopen` (complete → review), `deploy`.
+Each method only works from its own source state (`submitForReview()` on a
+complete project throws; it never acts as `reopen()`). The three forward
+exits (`submitForReview`, `markComplete`, `deploy`) re-check exit criteria
+on both the current and the resulting state, because state can change
+during review and gates can key on the target state.
+
+Functional users get the same rules from `advanceState(project, to)`.
+`transitionState()` is the unguarded primitive; it only checks the edge
+exists.
 
 ### Observer Protocol
 
-Audit log that records every missed reaction, blocked gate, and state transition. Catches "action without reaction" automatically.
+An audit log of every change, gate decision and missed reaction. Events are
+frozen, carry a monotonic `seq`, and stream live via `subscribe()`. Derived
+warnings (`gate_triggered`, `proof_required`, `complexity_exceeded`) fire
+once per crossing, not on every call. `action_without_reaction` fires the
+moment a task completes without addressing a required dependency.
+
+```typescript
+import { createObserver, ContingencyEngine } from "never-forget";
+
+const observer = createObserver({ maxEvents: 5000 }); // ring buffer; oldest evicted
+const engine = new ContingencyEngine({ id: "p", name: "P" }, { observer });
+observer.droppedCount(); // events evicted so far
+```
+
+A throwing listener never breaks the engine; errors go to
+`onListenerError` (default `console.error`). Listeners must not mutate the
+engine synchronously; such calls throw (defer them with `queueMicrotask`).
+
+### Errors
+
+All errors extend `NeverForgetError`: `GateBlockedError` (with `gate` and
+`blockers`), `InvalidStateTransitionError`, `ValidationError` (with every
+`issue`), `DuplicateIdError`, `NotFoundError`, `ProjectLockedError`. A call
+that throws leaves the project state unchanged; a blocked call does record
+its blockers as `gate_blocked` audit events. Calls that change nothing log
+nothing.
 
 ## API
 
 | Export | Description |
 |--------|-------------|
 | `ContingencyEngine` | Main orchestrator — start here |
-| `createProject()` | Create a raw project object |
+| `createProject()` | Create a validated, immutable project object |
+| `addDependency()`, `addTask()`, `addLogicGate()`, `update*State()` | Pure, immutable project edits |
+| `advanceState()`, `getExitBlockers()` | Guarded lifecycle for the pure API |
 | `evaluateEntryGate()` | Check if gate passes |
-| `runPreFlightChecks()` | Station check at 0% |
+| `runPreFlightChecks()` | Station check at 0% (advisory checks have `blocking: false`) |
 | `runPostFlightChecks()` | Station check at 100% |
+| `findMissingReactions()` | Every (task, required dependency) pair not yet addressed |
 | `generateShadowTasks()` | Auto-create dependency reactions |
+| `evaluateAllGates()`, `evaluateGateDetailed()` | Evaluate logic gates |
 | `createObserver()` | Standalone audit logger |
-| `evaluateAllGates()` | Evaluate all logic gates |
 
 ## Develop
 
 ```bash
-npm test          # run tests (vitest)
-npm run lint      # eslint
-npm run build     # compile to dist/
+npm run check     # typecheck + lint + tests (incl. 300-seed fuzz)
+npm run build     # compile to dist/ (tests excluded)
 ```
+
+Requires Node 18+ (or any runtime with `structuredClone`).
 
 ## Security
 

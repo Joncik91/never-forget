@@ -1,53 +1,141 @@
-import type {
-  Project,
-  ProjectConfig,
-  ProjectState,
-  Dependency,
-  DependencyState,
-  Task,
-  GateResult,
-  CheckResult,
-  FlightCheckResult,
+import {
+  DONE_DEPENDENCY_STATES,
+  PROJECT_SUBJECT,
+  TASK_STATES,
+  UNREADY_DEPENDENCY_STATES,
+  type CheckResult,
+  type Dependency,
+  type DependencyState,
+  type FlightCheckResult,
+  type GateResult,
+  type LogicGate,
+  type Project,
+  type ProjectConfig,
+  type ProjectState,
+  type Reaction,
+  type ReactionSelector,
+  type Task,
+  type TaskState,
 } from "./types.js";
-import { GateBlockedError, InvalidStateTransitionError } from "./errors.js";
+import {
+  DuplicateIdError,
+  GateBlockedError,
+  InvalidStateTransitionError,
+  NotFoundError,
+  ProjectLockedError,
+  ValidationError,
+} from "./errors.js";
+import { getTaskBlockers } from "./logic-gate.js";
+import {
+  assertValidConfigShape,
+  assertValidDependency,
+  assertValidLogicGate,
+  assertValidTask,
+  dependencyIssues,
+} from "./validate.js";
 
-const VALID_TRANSITIONS: Record<ProjectState, ProjectState[]> = {
+// Pure, immutable core. Every function returns a new Project and never mutates
+// its input. Inputs are deep-copied so later caller mutations cannot leak in.
+
+const VALID_TRANSITIONS: Readonly<Record<ProjectState, readonly ProjectState[]>> = {
   defined: ["gated"],
   gated: ["building"],
-  building: ["review", "building"],
+  building: ["review"],
   review: ["complete", "building"],
   complete: ["deployed", "review"],
   deployed: [],
 };
 
-export function createProject(config: ProjectConfig): Project {
-  return {
+export function canTransition(from: ProjectState, to: ProjectState): boolean {
+  return VALID_TRANSITIONS[from].includes(to);
+}
+
+export function assertCanTransition(project: Project, to: ProjectState): void {
+  if (!canTransition(project.state, to)) {
+    const allowed = VALID_TRANSITIONS[project.state];
+    throw new InvalidStateTransitionError(
+      project.state,
+      to,
+      allowed.length > 0
+        ? `Valid transitions from ${project.state}: ${allowed.join(", ")}`
+        : `${project.state} is a terminal state`,
+    );
+  }
+}
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+function touch(project: Project): Project {
+  return { ...project, updatedAt: now() };
+}
+
+function assertMutable(project: Project): void {
+  if (project.state === "deployed") throw new ProjectLockedError(project.id);
+}
+
+/** Dependencies and tasks share one id namespace so logic-gate subjects are unambiguous. */
+function assertEntityIdFree(project: Project, kind: string, id: string): void {
+  if (id === PROJECT_SUBJECT || id === project.id) {
+    throw new DuplicateIdError(kind, id, "clashes with the project subject");
+  }
+  if (project.dependencies.some((d) => d.id === id)) {
+    throw new DuplicateIdError(kind, id, kind === "Dependency" ? "already exists" : "is already used by a dependency");
+  }
+  if (project.tasks.some((t) => t.id === id)) {
+    throw new DuplicateIdError(kind, id, kind === "Task" ? "already exists" : "is already used by a task");
+  }
+}
+
+function dependencyIdSet(project: Project): Set<string> {
+  return new Set(project.dependencies.map((d) => d.id));
+}
+
+/** Deep copy of caller input. Non-cloneable input (functions, proxies) becomes a ValidationError. */
+function clone<T>(value: T, what: string): T {
+  try {
+    return structuredClone(value);
+  } catch (err) {
+    throw new ValidationError(what, [`must be plain data (${err instanceof Error ? err.message : String(err)})`]);
+  }
+}
+
+// --- Construction ---
+
+export function createProject(input: ProjectConfig): Project {
+  const config = clone(input, "project config");
+  assertValidConfigShape(config);
+  const timestamp = now();
+  let project: Project = {
     id: config.id,
     name: config.name,
     description: config.description ?? "",
     state: "defined",
-    dependencies: config.dependencies ?? [],
-    logicGates: config.logicGates ?? [],
-    tasks: config.tasks ?? [],
+    dependencies: [],
+    logicGates: [],
+    tasks: [],
     complexityThreshold: config.complexityThreshold ?? 10,
     requireProofOfWork: config.requireProofOfWork ?? false,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt: timestamp,
+    updatedAt: timestamp,
   };
+  // Route collections through the same validated insert path as later edits.
+  for (const dep of config.dependencies ?? []) project = addDependency(project, dep);
+  for (const task of config.tasks ?? []) project = addTask(project, task);
+  for (const gate of config.logicGates ?? []) project = addLogicGate(project, gate);
+  return { ...project, updatedAt: timestamp };
 }
 
-export function addDependency(
-  project: Project,
-  dependency: Dependency,
-): Project {
-  const existing = project.dependencies.find((d) => d.id === dependency.id);
-  if (existing) {
-    throw new Error(`Dependency ${dependency.id} already exists`);
-  }
-  return touch({
-    ...project,
-    dependencies: [...project.dependencies, dependency],
-  });
+// --- Dependencies ---
+
+export function addDependency(project: Project, dependency: Dependency): Project {
+  assertMutable(project);
+  // Clone before validating so getters cannot pass validation and then change.
+  const dep = clone(dependency, "dependency");
+  assertValidDependency(dep);
+  assertEntityIdFree(project, "Dependency", dep.id);
+  return touch({ ...project, dependencies: [...project.dependencies, dep] });
 }
 
 export function updateDependencyState(
@@ -56,36 +144,143 @@ export function updateDependencyState(
   newState: DependencyState,
   proofOfWork?: string,
 ): Project {
-  const deps = project.dependencies.map((d) =>
-    d.id === dependencyId
-      ? { ...d, state: newState, proofOfWork: proofOfWork ?? d.proofOfWork }
-      : d,
-  );
-  if (deps.every((d) => d.id !== dependencyId)) {
-    throw new Error(`Dependency ${dependencyId} not found`);
+  assertMutable(project);
+  const index = project.dependencies.findIndex((d) => d.id === dependencyId);
+  if (index === -1) throw new NotFoundError("Dependency", dependencyId);
+  const current = project.dependencies[index];
+  if (current.state === newState && (proofOfWork === undefined || proofOfWork === current.proofOfWork)) {
+    return project;
   }
-  return touch({ ...project, dependencies: deps });
+  const next: Dependency = {
+    ...project.dependencies[index],
+    state: newState,
+    ...(proofOfWork !== undefined ? { proofOfWork } : {}),
+  };
+  const issues = dependencyIssues(next);
+  if (issues.length > 0) throw new ValidationError("dependency update", issues);
+  const dependencies = project.dependencies.slice();
+  dependencies[index] = next;
+  return touch({ ...project, dependencies });
 }
+
+// --- Tasks & reactions ---
 
 export function addTask(project: Project, task: Task): Project {
-  return touch({
-    ...project,
-    tasks: [...project.tasks, task],
-  });
+  assertMutable(project);
+  const copy = clone(task, "task");
+  assertValidTask(copy, dependencyIdSet(project));
+  assertEntityIdFree(project, "Task", copy.id);
+  const next = touch({ ...project, tasks: [...project.tasks, copy] });
+  if (copy.state === "complete") assertTaskNotBlocked(next, copy.id);
+  return next;
 }
 
-export function transitionState(
-  project: Project,
-  newState: ProjectState,
-): Project {
-  const allowed = VALID_TRANSITIONS[project.state];
-  if (!allowed.includes(newState)) {
-    throw new InvalidStateTransitionError(
-      project.state,
-      newState,
-      `Valid transitions from ${project.state}: ${allowed.join(", ")}`,
-    );
+function assertTaskState(state: unknown, what: string): asserts state is TaskState {
+  if (typeof state !== "string" || !(TASK_STATES as readonly string[]).includes(state)) {
+    throw new ValidationError(what, [`state must be one of ${TASK_STATES.join(", ")} (got ${JSON.stringify(state)})`]);
   }
+}
+
+function assertTaskNotBlocked(project: Project, taskId: string): void {
+  const blockers = getTaskBlockers(project, taskId);
+  if (blockers.length > 0) throw new GateBlockedError(blockers, `task:${taskId}`);
+}
+
+/** Completing a task is refused while a triggered `block` gate targets it. */
+export function updateTaskState(project: Project, taskId: string, newState: TaskState): Project {
+  assertMutable(project);
+  assertTaskState(newState, "task update");
+  const index = project.tasks.findIndex((t) => t.id === taskId);
+  if (index === -1) throw new NotFoundError("Task", taskId);
+  if (project.tasks[index].state === newState) return project;
+  if (newState === "complete") assertTaskNotBlocked(project, taskId);
+  const tasks = project.tasks.slice();
+  tasks[index] = { ...tasks[index], state: newState };
+  return touch({ ...project, tasks });
+}
+
+function selectReactions(task: Task, selector: ReactionSelector): Reaction[] {
+  const sel: unknown = selector;
+  const valid =
+    typeof sel === "object" && sel !== null &&
+    (typeof (sel as { reactionId?: unknown }).reactionId === "string" ||
+      typeof (sel as { dependencyId?: unknown }).dependencyId === "string");
+  if (!valid) {
+    throw new ValidationError("reaction selector", ["must be { reactionId: string } or { dependencyId: string }"]);
+  }
+  if ("reactionId" in selector) {
+    const r = task.reactions.find((x) => x.id === selector.reactionId);
+    if (!r) throw new NotFoundError(`Reaction on task ${task.id}`, selector.reactionId);
+    return [r];
+  }
+  const matches = task.reactions.filter((x) => x.dependencyId === selector.dependencyId);
+  if (matches.length === 0) {
+    throw new NotFoundError(`Reaction for dependency on task ${task.id}`, selector.dependencyId);
+  }
+  return matches;
+}
+
+/** Updates one reaction (by id) or every reaction of a task for one dependency. */
+export function updateReactionState(
+  project: Project,
+  taskId: string,
+  selector: ReactionSelector,
+  newState: TaskState,
+  proofOfWork?: string,
+): Project {
+  assertMutable(project);
+  assertTaskState(newState, "reaction update");
+  if (proofOfWork !== undefined && (typeof proofOfWork !== "string" || proofOfWork.trim() === "")) {
+    throw new ValidationError("reaction update", ["proofOfWork must be a non-empty string when set"]);
+  }
+  const index = project.tasks.findIndex((t) => t.id === taskId);
+  if (index === -1) throw new NotFoundError("Task", taskId);
+  const task = project.tasks[index];
+  const targets = new Set(selectReactions(task, selector).map((r) => r.id));
+  const reactions = task.reactions.map((r) =>
+    targets.has(r.id)
+      ? { ...r, state: newState, ...(proofOfWork !== undefined ? { proofOfWork } : {}) }
+      : r,
+  );
+  const tasks = project.tasks.slice();
+  tasks[index] = { ...task, reactions };
+  return touch({ ...project, tasks });
+}
+
+// --- Logic gates ---
+
+export function addLogicGate(project: Project, gate: LogicGate): Project {
+  assertMutable(project);
+  const copy = clone(gate, "logic gate");
+  assertValidLogicGate(copy);
+  if (project.logicGates.some((g) => g.id === copy.id)) {
+    throw new DuplicateIdError("Logic gate", copy.id);
+  }
+  return touch({ ...project, logicGates: [...project.logicGates, copy] });
+}
+
+export function setLogicGateEnabled(project: Project, gateId: string, enabled: boolean): Project {
+  assertMutable(project);
+  if (typeof enabled !== "boolean") {
+    throw new ValidationError("logic gate update", ["enabled must be a boolean"]);
+  }
+  const index = project.logicGates.findIndex((g) => g.id === gateId);
+  if (index === -1) throw new NotFoundError("Logic gate", gateId);
+  if (project.logicGates[index].enabled === enabled) return project;
+  const logicGates = project.logicGates.slice();
+  logicGates[index] = { ...logicGates[index], enabled };
+  return touch({ ...project, logicGates });
+}
+
+// --- State machine ---
+
+/**
+ * Low-level, UNGUARDED state change: checks only that the edge exists in the
+ * state machine. Use `advanceState()` (or the engine) to enforce the entry
+ * gate, exit criteria and logic gates.
+ */
+export function transitionState(project: Project, newState: ProjectState): Project {
+  assertCanTransition(project, newState);
   return touch({ ...project, state: newState });
 }
 
@@ -98,55 +293,55 @@ export function evaluateEntryGate(project: Project): GateResult {
   if (project.dependencies.length === 0) {
     blockers.push("No dependencies defined — at least one required dependency must exist");
     messages.push("FAIL: No dependencies defined");
+  } else if (!project.dependencies.some((d) => d.priority === "required")) {
+    blockers.push("No required dependencies defined — mark at least one dependency as required");
+    messages.push("FAIL: No required dependencies defined");
   }
 
   for (const dep of project.dependencies) {
-    if (dep.priority === "required") {
-      if (dep.state === "undefined" || dep.state === "identified") {
-        blockers.push(
-          `Required dependency "${dep.name}" (${dep.id}) is not ready (state: ${dep.state})`,
-        );
-        messages.push(`FAIL: ${dep.name} not ready`);
-      }
-
-      if (project.requireProofOfWork && !dep.proofOfWork) {
-        blockers.push(
-          `Required dependency "${dep.name}" (${dep.id}) has no proof of work`,
-        );
-        messages.push(`FAIL: ${dep.name} missing proof of work`);
-      }
+    if (dep.priority !== "required") continue;
+    if (UNREADY_DEPENDENCY_STATES.includes(dep.state)) {
+      blockers.push(`Required dependency "${dep.name}" (${dep.id}) is not ready (state: ${dep.state})`);
+      messages.push(`FAIL: ${dep.name} not ready`);
+    }
+    if (project.requireProofOfWork && !dep.proofOfWork) {
+      blockers.push(`Required dependency "${dep.name}" (${dep.id}) has no proof of work`);
+      messages.push(`FAIL: ${dep.name} missing proof of work`);
     }
   }
 
+  const passed = blockers.length === 0;
   return {
-    passed: blockers.length === 0,
-    blocked: blockers.length > 0,
-    messages: blockers.length === 0
-      ? ["All entry gate checks passed"]
-      : messages,
+    passed,
+    blocked: !passed,
+    messages: passed ? ["All entry gate checks passed"] : messages,
+    blockers,
   };
 }
 
 export function passEntryGate(project: Project): Project {
+  assertCanTransition(project, "gated");
   const result = evaluateEntryGate(project);
-  if (result.blocked) {
-    throw new GateBlockedError(result.messages);
-  }
+  if (result.blocked) throw new GateBlockedError(result.blockers, "entry");
   return transitionState(project, "gated");
 }
 
 // --- Pre-flight & Post-flight checks ---
 
-export function runPreFlightChecks(
-  project: Project,
-): FlightCheckResult {
-  const checks: CheckResult[] = [];
+function summarize(result: CheckResult[]): FlightCheckResult {
+  return {
+    allPassed: result.every((c) => c.passed || c.blocking === false),
+    checks: result,
+  };
+}
 
-  // Check: All required dependencies defined
-  const requiredDeps = project.dependencies.filter(
-    (d) => d.priority === "required",
-  );
+export function runPreFlightChecks(project: Project): FlightCheckResult {
+  const checks: CheckResult[] = [];
+  const requiredDeps = project.dependencies.filter((d) => d.priority === "required");
+
   checks.push({
+    id: "required-dependencies-defined",
+    blocking: true,
     passed: requiredDeps.length > 0,
     message:
       requiredDeps.length > 0
@@ -154,11 +349,10 @@ export function runPreFlightChecks(
         : "No required dependencies defined",
   });
 
-  // Check: All required dependencies at least identified
-  const unidentified = requiredDeps.filter(
-    (d) => d.state === "undefined",
-  );
+  const unidentified = requiredDeps.filter((d) => d.state === "undefined");
   checks.push({
+    id: "required-dependencies-identified",
+    blocking: true,
     passed: unidentified.length === 0,
     message:
       unidentified.length === 0
@@ -166,8 +360,9 @@ export function runPreFlightChecks(
         : `Unidentified dependencies: ${unidentified.map((d) => d.name).join(", ")}`,
   });
 
-  // Check: Logic gates exist
   checks.push({
+    id: "logic-gates-configured",
+    blocking: false,
     passed: project.logicGates.length > 0,
     message:
       project.logicGates.length > 0
@@ -175,25 +370,35 @@ export function runPreFlightChecks(
         : "No logic gates configured — consider adding conditional rules",
   });
 
-  return {
-    allPassed: checks.every((c) => c.passed),
-    checks,
-  };
+  return summarize(checks);
 }
 
-export function runPostFlightChecks(
+/** Every (task, required dependency) pair without a completed reaction. */
+export function findMissingReactions(
   project: Project,
-): FlightCheckResult {
-  const checks: CheckResult[] = [];
+): { task: Task; dependency: Dependency }[] {
+  const required = project.dependencies.filter((d) => d.priority === "required");
+  const missing: { task: Task; dependency: Dependency }[] = [];
+  for (const task of project.tasks) {
+    for (const dependency of required) {
+      const covered = task.reactions.some(
+        (r) => r.dependencyId === dependency.id && r.state === "complete",
+      );
+      if (!covered) missing.push({ task, dependency });
+    }
+  }
+  return missing;
+}
 
-  // Check: All required dependencies verified
-  const requiredDeps = project.dependencies.filter(
-    (d) => d.priority === "required",
-  );
-  const unverified = requiredDeps.filter(
-    (d) => d.state !== "verified" && d.state !== "complete",
-  );
+export function runPostFlightChecks(project: Project): FlightCheckResult {
+  const checks: CheckResult[] = [];
+  const requiredDeps = project.dependencies.filter((d) => d.priority === "required");
+  const requiredIds = new Set(requiredDeps.map((d) => d.id));
+
+  const unverified = requiredDeps.filter((d) => !DONE_DEPENDENCY_STATES.includes(d.state));
   checks.push({
+    id: "required-dependencies-done",
+    blocking: true,
     passed: unverified.length === 0,
     message:
       unverified.length === 0
@@ -201,37 +406,53 @@ export function runPostFlightChecks(
         : `Unverified: ${unverified.map((d) => d.name).join(", ")}`,
   });
 
-  // Check: All tasks complete
-  const incompleteTasks = project.tasks.filter(
-    (t) => t.state !== "complete",
-  );
+  const incompleteTasks = project.tasks.filter((t) => t.state !== "complete");
   checks.push({
+    id: "tasks-complete",
+    blocking: true,
     passed: incompleteTasks.length === 0,
     message:
       incompleteTasks.length === 0
         ? "All tasks complete"
         : `${incompleteTasks.length} incomplete tasks remain`,
+    ...(incompleteTasks.length > 0
+      ? { details: incompleteTasks.map((t) => `${t.name} (${t.state})`).join(", ") }
+      : {}),
   });
 
-  // Check: All reactions complete
-  const allReactions = project.tasks.flatMap((t) => t.reactions);
-  const incompleteReactions = allReactions.filter(
-    (r) => r.state !== "complete",
-  );
+  // The core invariant: no task ships without addressing every required dependency.
+  const missing = findMissingReactions(project);
   checks.push({
-    passed: incompleteReactions.length === 0,
+    id: "required-reactions-complete",
+    blocking: true,
+    passed: missing.length === 0,
     message:
-      incompleteReactions.length === 0
+      missing.length === 0
         ? "All reactions complete"
-        : `${incompleteReactions.length} incomplete reactions`,
+        : `${missing.length} incomplete reactions for required dependencies`,
+    ...(missing.length > 0
+      ? { details: missing.map((m) => `${m.task.name} → ${m.dependency.name}`).join(", ") }
+      : {}),
   });
 
-  // Check: Proof of work (if required)
+  const openOptional = project.tasks
+    .flatMap((t) => t.reactions)
+    .filter((r) => !requiredIds.has(r.dependencyId) && r.state !== "complete");
+  checks.push({
+    id: "non-required-reactions-complete",
+    blocking: false,
+    passed: openOptional.length === 0,
+    message:
+      openOptional.length === 0
+        ? "All reactions for non-required dependencies complete"
+        : `${openOptional.length} open reactions for non-required dependencies`,
+  });
+
   if (project.requireProofOfWork) {
-    const missingProof = requiredDeps.filter(
-      (d) => !d.proofOfWork,
-    );
+    const missingProof = requiredDeps.filter((d) => !d.proofOfWork);
     checks.push({
+      id: "proof-of-work",
+      blocking: true,
       passed: missingProof.length === 0,
       message:
         missingProof.length === 0
@@ -240,12 +461,15 @@ export function runPostFlightChecks(
     });
   }
 
-  return {
-    allPassed: checks.every((c) => c.passed),
-    checks,
-  };
+  return summarize(checks);
 }
 
-function touch(project: Project): Project {
-  return { ...project, updatedAt: new Date().toISOString() };
+/** True when a dependency claims to be done but proof is required and absent. */
+export function needsProof(project: Project, dep: Dependency): boolean {
+  return (
+    project.requireProofOfWork &&
+    dep.priority === "required" &&
+    DONE_DEPENDENCY_STATES.includes(dep.state) &&
+    !dep.proofOfWork
+  );
 }
