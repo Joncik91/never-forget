@@ -192,8 +192,9 @@ describe("evaluateEntryGate", () => {
   });
 
   it("ignores optional dependencies that are not ready", () => {
-    const p = addDependency(
-      makeProject(),
+    let p = addDependency(makeProject(), makeRequiredDep());
+    p = addDependency(
+      p,
       makeRequiredDep({ id: "opt-1", priority: "optional", state: "undefined" }),
     );
     const result = evaluateEntryGate(p);

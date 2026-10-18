@@ -1,17 +1,42 @@
 {
   "name": "never-forget",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Redundancy & Logical Contingency Framework — a dependency validation engine with Trigger-Action-Validation loops",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "build": "tsc",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src",
-    "format": "echo 'no formatter configured'"
+    "format": "echo 'no formatter configured'",
+    "check": "npm run typecheck && npm run lint && npm test",
+    "prepublishOnly": "npm run check && npm run build"
   },
-  "keywords": ["contingency", "dependency", "validation", "framework"],
+  "keywords": [
+    "contingency",
+    "dependency",
+    "validation",
+    "framework"
+  ],
   "author": "",
   "license": "MIT",
   "type": "module",

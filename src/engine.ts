@@ -1,236 +1,401 @@
 import type {
-  Project,
-  ProjectConfig,
-  ValidationResult,
-  GateResult,
-  FlightCheckResult,
-  ObserverEvent,
+  ComplexityResult,
   Dependency,
   DependencyState,
-  Task,
+  FlightCheckResult,
+  GateEvaluation,
+  GateResult,
   LogicGate,
+  ObserverEvent,
+  Project,
+  ProjectConfig,
+  ProjectState,
+  ReactionSelector,
+  Severity,
+  Task,
+  TaskState,
+  ValidationResult,
 } from "./types.js";
-import { createProject, evaluateEntryGate, passEntryGate, runPreFlightChecks, runPostFlightChecks, transitionState } from "./project.js";
-import { evaluateAllGates } from "./logic-gate.js";
+import {
+  addDependency,
+  addLogicGate,
+  addTask,
+  assertCanTransition,
+  createProject,
+  evaluateEntryGate,
+  findMissingReactions,
+  needsProof,
+  runPostFlightChecks,
+  runPreFlightChecks,
+  setLogicGateEnabled,
+  transitionState,
+  updateDependencyState,
+  updateReactionState,
+  updateTaskState,
+} from "./project.js";
+import { applyGeneratedTasks, evaluateAllGates, getTaskBlockers } from "./logic-gate.js";
 import { generateShadowTasks } from "./shadow-task.js";
+import { calculateComplexity } from "./complexity.js";
+import { GateBlockedError } from "./errors.js";
 import {
   createObserver,
-  scanForMissedReactions,
-  observeStateTransition,
-  observeGatePassed,
-  observeGateBlocked,
+  observeActionWithoutReaction,
   observeComplexityExceeded,
+  observeGateBlocked,
+  observeGatePassed,
+  observeStateTransition,
+  scanForMissedReactions,
   type Observer,
+  type ObserverListener,
 } from "./observer.js";
 
 // ============================================================================
-// ContingencyEngine — The main orchestrator
+// ContingencyEngine — the stateful orchestrator around the pure core.
+//
+// Every mutation is atomic: the next state is computed by a pure function
+// (which throws on invalid input), then committed in one step. After each
+// commit the engine reconciles derived state reactively — generated tasks,
+// logic-gate edges, complexity and proof warnings — so consumers subscribe to
+// events instead of polling.
 // ============================================================================
 
-export class ContingencyEngine {
-  private project: Project;
-  private observer: Observer;
+export interface EngineOptions {
+  /** Supply your own observer (custom capacity, shared log, test clock). */
+  observer?: Observer;
+}
 
-  constructor(config: ProjectConfig) {
-    this.project = createProject(config);
-    this.observer = createObserver();
+export interface ExitCriteria {
+  passed: boolean;
+  blockers: string[];
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const key of Object.keys(value)) deepFreeze((value as Record<string, unknown>)[key]);
+  }
+  return value;
+}
+
+function gateSeverity(r: GateEvaluation): Severity {
+  if (r.status === "invalid" || r.blocksProject || r.blocksTask) return "error";
+  return r.action.type === "warn" ? "warning" : "info";
+}
+
+export class ContingencyEngine {
+  #project: Project;
+  readonly #observer: Observer;
+  /** Last seen status per gate, for edge-triggered events. */
+  readonly #gateState = new Map<string, string>();
+  readonly #proofFlagged = new Set<string>();
+  readonly #reportedSkips = new Set<string>();
+  #complexityExceeded = false;
+
+  constructor(config: ProjectConfig, options: EngineOptions = {}) {
+    this.#observer = options.observer ?? createObserver();
+    this.#project = deepFreeze(createProject(config));
+    this.#apply(this.#project);
   }
 
   // --- Read-only access ---
 
+  /** Deep-frozen snapshot. Safe to keep; never changes after it is returned. */
   getProject(): Readonly<Project> {
-    return this.project;
+    return this.#project;
   }
 
-  getEvents(): ObserverEvent[] {
-    return this.observer.getEvents();
+  getEvents(): Readonly<ObserverEvent>[] {
+    return this.#observer.getEvents();
   }
 
-  getErrors(): ObserverEvent[] {
-    return this.observer.getEventsBySeverity("error");
+  getErrors(): Readonly<ObserverEvent>[] {
+    return this.#observer.getEventsBySeverity("error");
   }
 
-  getWarnings(): ObserverEvent[] {
-    return this.observer.getEventsBySeverity("warning");
+  getWarnings(): Readonly<ObserverEvent>[] {
+    return this.#observer.getEventsBySeverity("warning");
+  }
+
+  /** Live event stream. Returns an unsubscribe function. */
+  subscribe(listener: ObserverListener): () => void {
+    return this.#observer.subscribe(listener);
   }
 
   // --- Dependencies ---
 
   addDependency(dependency: Dependency): this {
-    const existing = this.project.dependencies.find((d) => d.id === dependency.id);
-    if (existing) {
-      throw new Error(`Dependency ${dependency.id} already exists`);
-    }
-    this.project = {
-      ...this.project,
-      dependencies: [...this.project.dependencies, dependency],
-      updatedAt: new Date().toISOString(),
-    };
-    this.observer.log({
-      type: "dependency_added",
-      subject: dependency.id,
-      details: `Dependency "${dependency.name}" added with priority ${dependency.priority}`,
-      severity: "info",
-    });
+    const next = addDependency(this.#project, dependency);
+    this.#apply(next, () =>
+      this.#log("dependency_added", dependency.id, `Dependency "${dependency.name}" added with priority ${dependency.priority}`),
+    );
     return this;
   }
 
-  updateDependencyState(
-    dependencyId: string,
-    newState: DependencyState,
-    proofOfWork?: string,
-  ): this {
-    const deps = this.project.dependencies.map((d) =>
-      d.id === dependencyId
-        ? { ...d, state: newState, proofOfWork: proofOfWork ?? d.proofOfWork }
-        : d,
+  updateDependencyState(dependencyId: string, newState: DependencyState, proofOfWork?: string): this {
+    const before = this.#project.dependencies.find((d) => d.id === dependencyId)?.state;
+    const next = updateDependencyState(this.#project, dependencyId, newState, proofOfWork);
+    this.#apply(next, () =>
+      this.#log(
+        "dependency_updated",
+        dependencyId,
+        `Dependency state ${before} → ${newState}${proofOfWork !== undefined ? " (proof attached)" : ""}`,
+      ),
     );
-    if (deps.every((d) => d.id !== dependencyId)) {
-      throw new Error(`Dependency ${dependencyId} not found`);
-    }
-    this.project = { ...this.project, dependencies: deps, updatedAt: new Date().toISOString() };
     return this;
   }
 
   // --- Tasks ---
 
   addTask(task: Task): this {
-    this.project = {
-      ...this.project,
-      tasks: [...this.project.tasks, task],
-      updatedAt: new Date().toISOString(),
-    };
+    const next = addTask(this.#project, task);
+    if (task.state === "complete") this.#assertTaskNotBlocked(next, task.id);
+    this.#apply(next, () => {
+      this.#log("task_added", task.id, `Task "${task.name}" added (${task.state})`);
+      if (task.state === "complete") this.#flagUnaddressed(task.id);
+    });
     return this;
   }
 
-  updateTaskState(taskId: string, newState: Task["state"]): this {
-    const tasks = this.project.tasks.map((t) =>
-      t.id === taskId ? { ...t, state: newState } : t,
-    );
-    if (tasks.every((t) => t.id !== taskId)) {
-      throw new Error(`Task ${taskId} not found`);
-    }
-    this.project = { ...this.project, tasks, updatedAt: new Date().toISOString() };
+  updateTaskState(taskId: string, newState: TaskState): this {
+    const before = this.#project.tasks.find((t) => t.id === taskId)?.state;
+    if (newState === "complete" && before !== "complete") this.#assertTaskNotBlocked(this.#project, taskId);
+    const next = updateTaskState(this.#project, taskId, newState);
+    this.#apply(next, () => {
+      this.#log("task_updated", taskId, `Task state ${before} → ${newState}`);
+      if (newState === "complete" && before !== "complete") this.#flagUnaddressed(taskId);
+    });
+    return this;
+  }
+
+  /** Update one reaction (`{ reactionId }`) or all of a task's reactions for a dependency (`{ dependencyId }`). */
+  updateReactionState(
+    taskId: string,
+    selector: ReactionSelector,
+    newState: TaskState,
+    proofOfWork?: string,
+  ): this {
+    const next = updateReactionState(this.#project, taskId, selector, newState, proofOfWork);
+    const which = "reactionId" in selector ? `reaction ${selector.reactionId}` : `reactions for ${selector.dependencyId}`;
+    this.#apply(next, () => this.#log("reaction_updated", taskId, `Task "${taskId}" ${which} → ${newState}`));
     return this;
   }
 
   // --- Logic Gates ---
 
   addLogicGate(gate: LogicGate): this {
-    this.project = {
-      ...this.project,
-      logicGates: [...this.project.logicGates, gate],
-      updatedAt: new Date().toISOString(),
-    };
+    const next = addLogicGate(this.#project, gate);
+    this.#apply(next, () => this.#log("logic_gate_added", gate.id, `Logic gate "${gate.name}" added`));
+    return this;
+  }
+
+  setLogicGateEnabled(gateId: string, enabled: boolean): this {
+    const next = setLogicGateEnabled(this.#project, gateId, enabled);
+    this.#apply(next, () =>
+      this.#log("logic_gate_updated", gateId, `Logic gate ${enabled ? "enabled" : "disabled"}`),
+    );
     return this;
   }
 
   // --- Shadow Tasks ---
 
   generateShadowTasks(): this {
-    this.project = generateShadowTasks(this.project);
-    this.observer.log({
-      type: "shadow_task_generated",
-      subject: "project",
-      details: "Shadow tasks generated for all dependencies",
-      severity: "info",
-    });
+    const countReactions = (p: Project) => p.tasks.reduce((n, t) => n + t.reactions.length, 0);
+    const next = generateShadowTasks(this.#project);
+    const added = countReactions(next) - countReactions(this.#project);
+    this.#apply(next, () =>
+      this.#log("shadow_task_generated", "project", `${added} shadow reaction(s) generated`),
+    );
     return this;
   }
 
   // --- Gate Evaluation ---
 
   evaluateEntryGate(): GateResult {
-    return evaluateEntryGate(this.project);
+    return evaluateEntryGate(this.#project);
   }
 
   passEntryGate(): this {
-    const result = evaluateEntryGate(this.project);
+    assertCanTransition(this.#project, "gated");
+    const result = evaluateEntryGate(this.#project);
     if (result.blocked) {
-      for (const msg of result.messages) {
-        observeGateBlocked(this.observer, "entry", msg);
-      }
-      throw new Error(`Entry gate blocked: ${result.messages.join("; ")}`);
+      for (const blocker of result.blockers) observeGateBlocked(this.#observer, "entry", blocker);
+      throw new GateBlockedError(result.blockers, "entry");
     }
-    observeGatePassed(this.observer, "entry");
-    this.project = passEntryGate(this.project);
-    observeStateTransition(this.observer, "defined", "gated");
+    const from = this.#project.state;
+    this.#apply(transitionState(this.#project, "gated"), () => {
+      observeGatePassed(this.#observer, "entry");
+      observeStateTransition(this.#observer, from, "gated");
+    });
     return this;
   }
 
   evaluateLogicGates(): ValidationResult {
-    return evaluateAllGates(this.project);
+    return evaluateAllGates(this.#project);
   }
 
   // --- Flight Checks ---
 
   runPreFlightChecks(): FlightCheckResult {
-    return runPreFlightChecks(this.project);
+    return runPreFlightChecks(this.#project);
   }
 
   runPostFlightChecks(): FlightCheckResult {
-    return runPostFlightChecks(this.project);
+    return runPostFlightChecks(this.#project);
+  }
+
+  /** Everything that would stop the project leaving the build right now: post-flight failures and blocking logic gates. */
+  checkExitCriteria(): ExitCriteria {
+    const blockers: string[] = [];
+    for (const check of runPostFlightChecks(this.#project).checks) {
+      if (!check.passed && check.blocking !== false) {
+        blockers.push(check.details ? `${check.message}: ${check.details}` : check.message);
+      }
+    }
+    blockers.push(...evaluateAllGates(this.#project).errors);
+    return { passed: blockers.length === 0, blockers };
   }
 
   // --- State Transitions ---
 
   startBuilding(): this {
-    this.project = transitionState(this.project, "building");
-    observeStateTransition(this.observer, "gated", "building");
-    return this;
+    return this.#transition("building", false);
   }
 
+  /** building → review. Requires exit criteria. */
   submitForReview(): this {
-    const postFlight = runPostFlightChecks(this.project);
-    if (!postFlight.allPassed) {
-      const failed = postFlight.checks
-        .filter((c) => !c.passed)
-        .map((c) => c.message);
-      throw new Error(`Post-flight checks failed: ${failed.join("; ")}`);
-    }
-    this.project = transitionState(this.project, "review");
-    observeStateTransition(this.observer, "building", "review");
-    return this;
+    return this.#transition("review", true);
   }
 
+  /** review → building, for rework after review. */
+  requestChanges(): this {
+    return this.#transition("building", false);
+  }
+
+  /** review → complete. Re-checks exit criteria; state may have changed during review. */
   markComplete(): this {
-    this.project = transitionState(this.project, "complete");
-    observeStateTransition(this.observer, "review", "complete");
-    return this;
+    return this.#transition("complete", true);
   }
 
+  /** complete → review. */
+  reopen(): this {
+    return this.#transition("review", false);
+  }
+
+  /** complete → deployed (terminal, immutable). Re-checks exit criteria. */
   deploy(): this {
-    this.project = transitionState(this.project, "deployed");
-    observeStateTransition(this.observer, "complete", "deployed");
-    return this;
+    return this.#transition("deployed", true);
   }
 
-  // --- Complexity Check ---
+  // --- Complexity ---
 
-  checkComplexity(): { exceeded: boolean; score: number; threshold: number } {
-    const score = this.calculateComplexity();
-    const threshold = this.project.complexityThreshold;
-    const exceeded = score > threshold;
-    if (exceeded) {
-      observeComplexityExceeded(this.observer, score, threshold);
-    }
-    return { exceeded, score, threshold };
+  /** Pure query. Crossing the threshold is logged automatically, once per crossing. */
+  checkComplexity(): ComplexityResult {
+    const score = calculateComplexity(this.#project);
+    const threshold = this.#project.complexityThreshold;
+    return { exceeded: score > threshold, score, threshold };
   }
 
   // --- Observer Scans ---
 
   scanForMissedReactions(): number {
-    return scanForMissedReactions(this.project, this.observer);
+    return scanForMissedReactions(this.#project, this.#observer);
   }
 
   // --- Internal ---
 
-  private calculateComplexity(): number {
-    return (
-      this.project.dependencies.length * 2 +
-      this.project.tasks.length +
-      this.project.tasks.reduce((sum, t) => sum + t.reactions.length, 0) +
-      this.project.logicGates.length
-    );
+  #log(type: ObserverEvent["type"], subject: string, details: string, severity: Severity = "info"): void {
+    this.#observer.log({ type, subject, details, severity });
+  }
+
+  #transition(to: ProjectState, requireExitCriteria: boolean): this {
+    assertCanTransition(this.#project, to);
+    if (requireExitCriteria) {
+      const exit = this.checkExitCriteria();
+      if (!exit.passed) {
+        for (const blocker of exit.blockers) observeGateBlocked(this.#observer, "exit", blocker);
+        throw new GateBlockedError(exit.blockers, "exit");
+      }
+    }
+    const from = this.#project.state;
+    this.#apply(transitionState(this.#project, to), () => {
+      if (requireExitCriteria) observeGatePassed(this.#observer, "exit");
+      observeStateTransition(this.#observer, from, to);
+    });
+    return this;
+  }
+
+  #assertTaskNotBlocked(project: Project, taskId: string): void {
+    const blockers = getTaskBlockers(project, taskId);
+    if (blockers.length === 0) return;
+    for (const b of blockers) observeGateBlocked(this.#observer, `task:${taskId}`, b);
+    throw new GateBlockedError(blockers, `task:${taskId}`);
+  }
+
+  /** Real-time "action without reaction" detection when a task completes. */
+  #flagUnaddressed(taskId: string): void {
+    for (const m of findMissingReactions(this.#project)) {
+      if (m.task.id === taskId) observeActionWithoutReaction(this.#observer, m.task.name, m.dependency.name);
+    }
+  }
+
+  /** Commits a new state, logs the triggering action, then reconciles derived state. */
+  #apply(next: Project, logAction?: () => void): void {
+    const { project, generated, skipped } = applyGeneratedTasks(next);
+    this.#project = deepFreeze(project);
+    logAction?.();
+
+    for (const g of generated) {
+      this.#log("task_generated", g.task.id, `Task "${g.task.name}" generated by logic gate ${g.gateId}`);
+    }
+    for (const s of skipped) {
+      const key = `${s.gateId}\u0000${s.taskId}`;
+      if (this.#reportedSkips.has(key)) continue;
+      this.#reportedSkips.add(key);
+      this.#log("gate_blocked", s.gateId, `Cannot generate task "${s.taskId}": ${s.reason}`, "error");
+    }
+
+    this.#reconcileGates();
+    this.#reconcileProof();
+    this.#reconcileComplexity();
+  }
+
+  #reconcileGates(): void {
+    const results = new Map(evaluateAllGates(this.#project).results.map((r) => [r.gateId, r]));
+    for (const gate of this.#project.logicGates) {
+      const r = results.get(gate.id);
+      const status = r?.status ?? "idle";
+      const key = `${status}\u0000${r?.message ?? ""}`;
+      const prev = this.#gateState.get(gate.id) ?? `idle\u0000`;
+      if (key === prev) continue;
+      this.#gateState.set(gate.id, key);
+      if (!r || status === "idle") {
+        this.#log("gate_cleared", gate.id, `Logic gate "${gate.name}" no longer triggered`);
+      } else {
+        this.#log(
+          "gate_triggered",
+          gate.id,
+          r.message ?? `Logic gate "${gate.name}" triggered; requirement satisfied`,
+          gateSeverity(r),
+        );
+      }
+    }
+  }
+
+  #reconcileProof(): void {
+    for (const dep of this.#project.dependencies) {
+      if (needsProof(this.#project, dep)) {
+        if (this.#proofFlagged.has(dep.id)) continue;
+        this.#proofFlagged.add(dep.id);
+        this.#log("proof_required", dep.id, `Dependency "${dep.name}" is ${dep.state} but has no proof of work`, "warning");
+      } else {
+        this.#proofFlagged.delete(dep.id);
+      }
+    }
+  }
+
+  #reconcileComplexity(): void {
+    const { exceeded, score, threshold } = this.checkComplexity();
+    if (exceeded && !this.#complexityExceeded) observeComplexityExceeded(this.#observer, score, threshold);
+    this.#complexityExceeded = exceeded;
   }
 }

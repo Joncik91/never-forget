@@ -70,6 +70,14 @@ describe("ContingencyEngine — Full Lifecycle", () => {
     engine.startBuilding();
     expect(engine.getProject().state).toBe("building");
 
+    // Every task must address every required dependency before it ships
+    engine.generateShadowTasks();
+    for (const taskId of ["migrate-db", "deploy"]) {
+      for (const depId of ["docs", "tests"]) {
+        engine.updateReactionState(taskId, { dependencyId: depId }, "complete");
+      }
+    }
+
     // Complete tasks
     engine.updateTaskState("migrate-db", "complete");
     engine.updateTaskState("deploy", "complete");
